@@ -78,16 +78,43 @@ exact shape:
 
 def fetch_weekly_data() -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=4000,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": SEARCH_BRIEF}],
-    )
+    messages = [{"role": "user", "content": SEARCH_BRIEF}]
+    response = None
+
+    # Web search can take several search rounds to finish. If the model
+    # pauses mid-search (stop_reason "pause_turn") or is cut off by the
+    # token limit, feed its partial turn back in and let it continue,
+    # rather than treating an incomplete response as a final answer.
+    for _ in range(6):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=8000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=messages,
+        )
+        if response.stop_reason == "pause_turn":
+            messages.append({"role": "assistant", "content": response.content})
+            continue
+        break
+
     text_blocks = [b.text for b in response.content if b.type == "text"]
     raw = "\n".join(text_blocks).strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+
+    if not raw:
+        print("No text content in the model's response. Full response for debugging:")
+        print(response.model_dump_json(indent=2))
+        raise RuntimeError(
+            f"Empty response from Claude (stop_reason={response.stop_reason}). "
+            "See the debug output above."
+        )
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        print("Response was not valid JSON. Raw text received:")
+        print(raw)
+        raise
 
 
 def build_docx(data: dict, week_of: str) -> str:
