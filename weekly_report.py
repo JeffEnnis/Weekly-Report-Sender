@@ -21,6 +21,7 @@ import datetime
 import base64
 import sys
 import logging
+from typing import Optional, Dict, Any
 
 import anthropic
 import requests
@@ -85,6 +86,47 @@ exact shape:
 """
 
 
+def validate_credentials() -> bool:
+    """
+    Validate that all required credentials are set and non-empty.
+    Returns True if all required creds present, False otherwise.
+    """
+    logger.info("Validating credentials...")
+    
+    required_creds = {
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+    }
+    
+    optional_creds = {
+        "AZURE_CLIENT_ID": AZURE_CLIENT_ID,
+        "AZURE_TENANT_ID": AZURE_TENANT_ID,
+        "AZURE_CLIENT_SECRET": AZURE_CLIENT_SECRET,
+        "SENDER_EMAIL": SENDER_EMAIL,
+        "REPORT_EMAIL_TO": REPORT_EMAIL_TO,
+    }
+    
+    all_valid = True
+    
+    # Check required credentials
+    for name, value in required_creds.items():
+        if not value or not value.strip():
+            logger.error(f"  ✗ {name} is missing or empty")
+            all_valid = False
+        else:
+            logger.info(f"  ✓ {name} is set (length: {len(value)})")
+    
+    # Check optional credentials (for email sending)
+    email_creds_present = all(optional_creds.values())
+    if not email_creds_present:
+        missing = [k for k, v in optional_creds.items() if not v or not v.strip()]
+        logger.warning(f"  ⚠ Some email credentials are missing: {missing}")
+        logger.warning("  Email sending will be skipped, but report will still be generated.")
+    else:
+        logger.info(f"  ✓ All email credentials are set")
+    
+    return all_valid
+
+
 def validate_json_structure(data: dict) -> bool:
     """Validate that the returned data has the expected structure."""
     required_keys = ["future_opportunities", "current_opportunities", "current_news", "key_connections"]
@@ -93,8 +135,10 @@ def validate_json_structure(data: dict) -> bool:
             logger.error(f"Missing required key: {key}")
             return False
         if not isinstance(data[key], list):
-            logger.error(f"Key '{key}' is not a list")
+            logger.error(f"Key '{key}' is not a list, got {type(data[key])}")
             return False
+        if len(data[key]) == 0:
+            logger.warning(f"Key '{key}' is an empty list")
     return True
 
 
@@ -103,6 +147,10 @@ def extract_json_from_text(raw: str) -> str:
     Robustly extract JSON from potentially malformed text.
     Handles markdown fences, preamble, and extra text.
     """
+    if not raw or not raw.strip():
+        logger.error("Raw response is empty or whitespace only")
+        return ""
+    
     # Remove markdown code fences
     raw = raw.replace("```json", "").replace("```", "").strip()
     
@@ -112,7 +160,7 @@ def extract_json_from_text(raw: str) -> str:
     
     if start == -1 or end == -1 or end <= start:
         logger.error("No valid JSON braces found in response")
-        logger.debug(f"Raw text (first 500 chars): {raw[:500]}")
+        logger.debug(f"Raw text (first 1000 chars): {raw[:1000]}")
         return ""
     
     extracted = raw[start:end + 1].strip()
@@ -121,15 +169,19 @@ def extract_json_from_text(raw: str) -> str:
         logger.error("Extracted JSON is empty")
         return ""
     
+    logger.debug(f"Extracted JSON (first 500 chars): {extracted[:500]}")
     return extracted
 
 
-def fetch_weekly_data() -> dict:
+def fetch_weekly_data() -> Dict[str, Any]:
     """
     Fetch weekly market data using Claude with web search.
     Includes comprehensive error handling and validation.
     """
     try:
+        if not ANTHROPIC_API_KEY:
+            raise RuntimeError("ANTHROPIC_API_KEY environment variable not set")
+        
         logger.info("Initializing Anthropic client...")
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         messages = [{"role": "user", "content": SEARCH_BRIEF}]
@@ -179,14 +231,20 @@ def fetch_weekly_data() -> dict:
             )
         
         raw = "\n".join(text_blocks).strip()
+        
+        if not raw:
+            logger.error("Combined text blocks resulted in empty string")
+            raise RuntimeError("Claude response text is empty after combining blocks")
+        
         logger.info(f"Received response ({len(raw)} chars). Extracting JSON...")
+        logger.debug(f"Response preview (first 500 chars): {raw[:500]}")
         
         # Extract JSON robustly
         json_str = extract_json_from_text(raw)
         
         if not json_str:
             logger.error("Could not extract valid JSON from response")
-            logger.error(f"Raw response (first 1000 chars):\n{raw[:1000]}")
+            logger.error(f"Raw response (first 2000 chars):\n{raw[:2000]}")
             raise RuntimeError("Response does not contain valid JSON")
         
         logger.info("Parsing JSON...")
@@ -194,7 +252,7 @@ def fetch_weekly_data() -> dict:
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
             logger.error(f"JSON decode error: {e}")
-            logger.error(f"JSON string (first 500 chars): {json_str[:500]}")
+            logger.error(f"JSON string (first 1000 chars): {json_str[:1000]}")
             raise RuntimeError(f"Failed to parse JSON: {e}")
         
         # Validate structure
@@ -211,7 +269,7 @@ def fetch_weekly_data() -> dict:
         raise
 
 
-def build_docx(data: dict, week_of: str) -> str:
+def build_docx(data: Dict[str, Any], week_of: str) -> str:
     """Build a formatted Word document with the weekly report."""
     try:
         logger.info("Creating Word document...")
@@ -240,21 +298,32 @@ def build_docx(data: dict, week_of: str) -> str:
             
             for i, item in enumerate(items):
                 try:
+                    if not isinstance(item, dict):
+                        logger.warning(f"Item {i} in section {key} is not a dict, skipping")
+                        continue
+                    
                     p = doc.add_paragraph()
                     run = p.add_run(item.get("title", "Untitled"))
                     run.bold = True
                     run.font.size = Pt(12)
-                    doc.add_paragraph(item.get("summary", ""))
+                    
+                    summary = item.get("summary", "")
+                    if summary:
+                        doc.add_paragraph(summary)
+                    
                     meta = doc.add_paragraph()
                     meta_run = meta.add_run(
-                        f"Source: {item.get('source','')}  |  Date: {item.get('date','')}  |  "
-                        f"Next action: {item.get('next_action','')}"
+                        f"Source: {item.get('source', '')}  |  Date: {item.get('date', '')}  |  "
+                        f"Next action: {item.get('next_action', '')}"
                     )
                     meta_run.italic = True
                     meta_run.font.size = Pt(9)
                     meta_run.font.color.rgb = RGBColor(0x59, 0x59, 0x59)
-                    if item.get("url"):
-                        doc.add_paragraph(item["url"])
+                    
+                    url = item.get("url")
+                    if url:
+                        doc.add_paragraph(url)
+                    
                     doc.add_paragraph()
                 except Exception as e:
                     logger.warning(f"Error adding item {i} in section {key}: {e}")
@@ -270,7 +339,7 @@ def build_docx(data: dict, week_of: str) -> str:
         raise
 
 
-def append_to_tracker(data: dict, found_date: str):
+def append_to_tracker(data: Dict[str, Any], found_date: str) -> None:
     """Append new opportunities and contacts to the leads tracker spreadsheet."""
     try:
         if not os.path.exists(TRACKER_PATH):
@@ -280,40 +349,52 @@ def append_to_tracker(data: dict, found_date: str):
         logger.info(f"Loading tracker from {TRACKER_PATH}...")
         wb = openpyxl.load_workbook(TRACKER_PATH)
 
-        opp_ws = wb["Opportunities"]
-        logger.info("Adding opportunities to tracker...")
-        for stage_key, stage_label in [("future_opportunities", "Future"), ("current_opportunities", "Current")]:
-            items = data.get(stage_key, [])
-            logger.info(f"  Adding {len(items)} {stage_label} opportunities")
-            for item in items:
+        if "Opportunities" not in wb.sheetnames:
+            logger.warning("'Opportunities' sheet not found in tracker — skipping opportunities.")
+        else:
+            opp_ws = wb["Opportunities"]
+            logger.info("Adding opportunities to tracker...")
+            for stage_key, stage_label in [("future_opportunities", "Future"), ("current_opportunities", "Current")]:
+                items = data.get(stage_key, [])
+                logger.info(f"  Adding {len(items)} {stage_label} opportunities")
+                for item in items:
+                    try:
+                        if not isinstance(item, dict):
+                            logger.warning(f"Item in {stage_key} is not a dict, skipping")
+                            continue
+                        opp_ws.append([
+                            found_date, stage_label, item.get("title", ""), "", "", "", "",
+                            "", item.get("source", ""), item.get("url", ""), "Not started",
+                            item.get("next_action", ""), item.get("summary", ""),
+                        ])
+                    except Exception as e:
+                        logger.warning(f"Error appending opportunity: {e}")
+
+        if "Contacts" not in wb.sheetnames:
+            logger.warning("'Contacts' sheet not found in tracker — skipping contacts.")
+        else:
+            contacts_ws = wb["Contacts"]
+            connections = data.get("key_connections", [])
+            logger.info(f"Adding {len(connections)} contacts to tracker...")
+            for item in connections:
                 try:
-                    opp_ws.append([
-                        found_date, stage_label, item.get("title", ""), "", "", "", "",
-                        "", item.get("source", ""), item.get("url", ""), "Not started",
+                    if not isinstance(item, dict):
+                        logger.warning(f"Item in key_connections is not a dict, skipping")
+                        continue
+                    contacts_ws.append([
+                        found_date, item.get("name", item.get("title", "")), "", item.get("company", ""),
+                        "", item.get("source", ""), item.get("url", ""), "", "", "Not contacted",
                         item.get("next_action", ""), item.get("summary", ""),
                     ])
                 except Exception as e:
-                    logger.warning(f"Error appending opportunity: {e}")
-
-        contacts_ws = wb["Contacts"]
-        connections = data.get("key_connections", [])
-        logger.info(f"Adding {len(connections)} contacts to tracker...")
-        for item in connections:
-            try:
-                contacts_ws.append([
-                    found_date, item.get("name", item.get("title", "")), "", item.get("company", ""),
-                    "", item.get("source", ""), item.get("url", ""), "", "", "Not contacted",
-                    item.get("next_action", ""), item.get("summary", ""),
-                ])
-            except Exception as e:
-                logger.warning(f"Error appending contact: {e}")
+                    logger.warning(f"Error appending contact: {e}")
 
         wb.save(TRACKER_PATH)
         logger.info("Tracker updated successfully")
         
     except Exception as e:
         logger.error(f"Error updating tracker: {e}", exc_info=True)
-        raise
+        # Don't raise here — tracker update failure shouldn't stop the report
 
 
 def get_graph_token() -> str:
@@ -323,6 +404,12 @@ def get_graph_token() -> str:
         logger.info(f"Using Azure Tenant: {AZURE_TENANT_ID}")
         logger.info(f"Using Azure Client ID: {AZURE_CLIENT_ID}")
         
+        if not AZURE_TENANT_ID or not AZURE_CLIENT_ID or not AZURE_CLIENT_SECRET:
+            raise RuntimeError(
+                "Azure credentials not fully set. "
+                "Requires AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET."
+            )
+        
         authority = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
         app = msal.ConfidentialClientApplication(
             AZURE_CLIENT_ID, authority=authority, client_credential=AZURE_CLIENT_SECRET
@@ -330,43 +417,69 @@ def get_graph_token() -> str:
         result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
         
         # Debug: Log the full result structure
-        logger.debug(f"MSAL result keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"MSAL result is not a dict: {type(result)}")
+        
+        logger.debug(f"MSAL result keys: {list(result.keys())}")
         
         if "access_token" not in result:
             error_msg = result.get('error', 'Unknown error')
-            error_description = result.get('error_description', '')
+            error_description = result.get('error_description', 'No description')
             full_error = f"{error_msg}: {error_description}" if error_description else error_msg
             
             logger.error(f"Failed to get Graph token")
             logger.error(f"  Error: {error_msg}")
             logger.error(f"  Description: {error_description}")
-            logger.error(f"  Full result: {result}")
+            logger.error(f"  Full result keys: {list(result.keys())}")
             
             raise RuntimeError(
                 f"Authentication failed. Verify your AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_CLIENT_SECRET are correct. "
                 f"Error: {full_error}"
             )
         
+        token = result.get("access_token")
+        if not token or not token.strip():
+            raise RuntimeError("Access token is empty")
+        
         logger.info("Graph token acquired successfully")
-        return result["access_token"]
+        return token
         
     except Exception as e:
         logger.error(f"Error getting Graph token: {e}", exc_info=True)
         raise
 
 
-def send_email_via_graph(filepath: str, week_of: str):
+def send_email_via_graph(filepath: str, week_of: str) -> None:
     """Send the report email via Microsoft Graph API."""
     try:
         if not (AZURE_CLIENT_ID and AZURE_TENANT_ID and AZURE_CLIENT_SECRET and SENDER_EMAIL and REPORT_EMAIL_TO):
-            logger.warning("Microsoft Graph credentials not fully set — skipping send. File saved at: " + filepath)
+            missing = []
+            if not AZURE_CLIENT_ID:
+                missing.append("AZURE_CLIENT_ID")
+            if not AZURE_TENANT_ID:
+                missing.append("AZURE_TENANT_ID")
+            if not AZURE_CLIENT_SECRET:
+                missing.append("AZURE_CLIENT_SECRET")
+            if not SENDER_EMAIL:
+                missing.append("SENDER_EMAIL")
+            if not REPORT_EMAIL_TO:
+                missing.append("REPORT_EMAIL_TO")
+            
+            logger.warning(f"Microsoft Graph credentials not fully set: {', '.join(missing)}")
+            logger.warning("Skipping email send. File saved at: " + filepath)
             return
 
         logger.info("Sending email via Outlook...")
         token = get_graph_token()
         
+        if not os.path.exists(filepath):
+            raise RuntimeError(f"Report file not found at {filepath}")
+        
         with open(filepath, "rb") as f:
-            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+            file_bytes = f.read()
+            if not file_bytes:
+                raise RuntimeError(f"Report file is empty: {filepath}")
+            content_b64 = base64.b64encode(file_bytes).decode("utf-8")
 
         message = {
             "message": {
@@ -393,47 +506,50 @@ def send_email_via_graph(filepath: str, week_of: str):
             timeout=30
         )
         
+        logger.debug(f"Graph API response status: {resp.status_code}")
+        
         if resp.status_code >= 300:
             logger.error(f"Graph sendMail failed ({resp.status_code}): {resp.text}")
             raise RuntimeError(f"Graph sendMail failed ({resp.status_code}): {resp.text}")
         
-        logger.info("Email sent via Outlook successfully")
+        logger.info("✓ Email sent via Outlook successfully")
         
     except Exception as e:
         logger.error(f"Error sending email: {e}", exc_info=True)
-        raise
+        # Don't raise here — email failure shouldn't stop the report from being generated
 
 
-def main():
+def main() -> None:
     """Main entry point for the weekly report script."""
     try:
         logger.info("=" * 60)
         logger.info("Starting Weekly Market Intelligence Report")
         logger.info("=" * 60)
         
-        if not ANTHROPIC_API_KEY:
-            raise SystemExit("Set the ANTHROPIC_API_KEY environment variable before running.")
+        # Validate credentials first
+        if not validate_credentials():
+            raise SystemExit("Required environment variables are missing. Set ANTHROPIC_API_KEY and try again.")
 
         week_of = datetime.date.today().isoformat()
         logger.info(f"Report date: {week_of}")
         
-        logger.info("Step 1/4: Fetching weekly data...")
+        logger.info("\nStep 1/4: Fetching weekly data from Claude...")
         data = fetch_weekly_data()
 
-        logger.info("Step 2/4: Building report document...")
+        logger.info("\nStep 2/4: Building report document...")
         filepath = build_docx(data, week_of)
 
-        logger.info("Step 3/4: Updating leads tracker...")
+        logger.info("\nStep 3/4: Updating leads tracker...")
         append_to_tracker(data, week_of)
 
         if SEND_EMAIL:
-            logger.info("Step 4/4: Emailing report via Outlook...")
+            logger.info("\nStep 4/4: Emailing report via Outlook...")
             send_email_via_graph(filepath, week_of)
         else:
-            logger.info("Step 4/4: Email sending disabled")
+            logger.info("\nStep 4/4: Email sending disabled")
 
         logger.info("=" * 60)
-        logger.info(f"✓ Done. Report saved to {filepath}")
+        logger.info(f"✓ Success! Report saved to {filepath}")
         logger.info("=" * 60)
         
     except Exception as e:
