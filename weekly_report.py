@@ -320,16 +320,32 @@ def get_graph_token() -> str:
     """Client-credentials auth against Azure AD, scoped to Microsoft Graph."""
     try:
         logger.info("Acquiring Microsoft Graph token...")
+        logger.info(f"Using Azure Tenant: {AZURE_TENANT_ID}")
+        logger.info(f"Using Azure Client ID: {AZURE_CLIENT_ID}")
+        
         authority = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
         app = msal.ConfidentialClientApplication(
             AZURE_CLIENT_ID, authority=authority, client_credential=AZURE_CLIENT_SECRET
         )
         result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
         
+        # Debug: Log the full result structure
+        logger.debug(f"MSAL result keys: {list(result.keys()) if isinstance(result, dict) else 'Not a dict'}")
+        
         if "access_token" not in result:
-            error_msg = result.get('error_description', 'Unknown error')
-            logger.error(f"Failed to get Graph token: {error_msg}")
-            raise RuntimeError(f"Failed to get Graph token: {error_msg}")
+            error_msg = result.get('error', 'Unknown error')
+            error_description = result.get('error_description', '')
+            full_error = f"{error_msg}: {error_description}" if error_description else error_msg
+            
+            logger.error(f"Failed to get Graph token")
+            logger.error(f"  Error: {error_msg}")
+            logger.error(f"  Description: {error_description}")
+            logger.error(f"  Full result: {result}")
+            
+            raise RuntimeError(
+                f"Authentication failed. Verify your AZURE_CLIENT_ID, AZURE_TENANT_ID, and AZURE_CLIENT_SECRET are correct. "
+                f"Error: {full_error}"
+            )
         
         logger.info("Graph token acquired successfully")
         return result["access_token"]
