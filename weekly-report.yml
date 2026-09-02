@@ -37,7 +37,7 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           REPORT_EMAIL_TO: ${{ secrets.REPORT_EMAIL_TO }}
-        run: python3 weekly_report.py
+        run: python3 weekly_report_v2.py
 
       - name: Commit updated leads tracker back to the repo
         run: |
